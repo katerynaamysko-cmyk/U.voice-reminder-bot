@@ -229,7 +229,6 @@ def main():
     app.add_handler(CommandHandler("remind", post_reminder_prompt))
     app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^remind\|"))
 
-    app.job_queue.run_once(lambda ctx: None, when=0)  # ensure job_queue initialized
     app.post_init = restore_pending_jobs
 
     logger.info("Бот запущено.")
