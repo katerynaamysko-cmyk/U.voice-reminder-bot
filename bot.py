@@ -37,7 +37,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 from telegram.error import Forbidden
 
@@ -139,8 +141,13 @@ async def channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Допоміжна команда: написати /channelid прямо в каналі/групі,
     щоб дізнатись його ID (знадобиться для змінної CHANNEL_ID).
+    Працює і для звичайних повідомлень, і для постів у каналі.
     """
-    await update.message.reply_text(f"ID цього чату: {update.effective_chat.id}")
+    msg = update.effective_message
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"ID цього чату: {update.effective_chat.id}",
+    )
 
 
 async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -254,7 +261,14 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("remind", post_reminder_prompt))
-    app.add_handler(CommandHandler("channelid", channel_id_cmd))
+    # CommandHandler за замовчуванням не завжди ловить пости в каналі (channel_post),
+    # тому окремо реєструємо /channelid через MessageHandler з явним фільтром.
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^/channelid") & (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST),
+            channel_id_cmd,
+        )
+    )
     app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^remind\|"))
 
     app.post_init = restore_pending_jobs
