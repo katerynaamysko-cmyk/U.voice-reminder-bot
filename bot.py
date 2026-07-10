@@ -114,6 +114,31 @@ def known_users_add(user_id: int):
     conn.close()
 
 
+def save_pending_text(text: str) -> int:
+    """Зберігає повний текст поста окремо (кнопка не може містити довгий текст)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pending_texts (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL)"
+    )
+    cur = conn.execute("INSERT INTO pending_texts (text) VALUES (?)", (text,))
+    conn.commit()
+    pending_id = cur.lastrowid
+    conn.close()
+    return pending_id
+
+
+def get_pending_text(pending_id: int) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pending_texts (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL)"
+    )
+    row = conn.execute(
+        "SELECT text FROM pending_texts WHERE id = ?", (pending_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else "Нагадування"
+
+
 def is_known_user(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -153,7 +178,9 @@ async def channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /remind — пишеться ПРИВАТНО боту (не в каналі!).
-    Приклад: /remind Не забудьте подати заявку!
+    Приклад:
+        /remind Стажування в Bocconi — дедлайн 20 липня
+    Можна писати багаторядковий текст з емодзі — форматування збережеться.
     Бот сам публікує повідомлення з кнопками в канал (CHANNEL_ID),
     тому в каналі ніхто не побачить, хто саме викликав команду.
     """
@@ -169,15 +196,24 @@ async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    text = " ".join(context.args) if context.args else "Нагадати про це?"
+    # Беремо весь текст після "/remind ", зберігаючи переноси рядків і форматування.
+    full_text = update.message.text or ""
+    parts = full_text.split(maxsplit=1)
+    text = parts[1] if len(parts) > 1 else "Нагадати про це?"
+
+    # callback_data в Telegram обмежений 64 байтами, тому довгий текст
+    # там не вміститься — зберігаємо його окремо в базі, а в кнопку кладемо лише ID.
+    pending_id = save_pending_text(text)
+
     keyboard = [
-        [InlineKeyboardButton(label, callback_data=f"remind|{i}|{text}")]
+        [InlineKeyboardButton(label, callback_data=f"remind|{i}|{pending_id}")]
         for i, (label, _) in enumerate(REMINDER_OPTIONS)
     ]
     await context.bot.send_message(
         chat_id=CHANNEL_ID,
-        text=f"📌 {text}\n\nОберіть, коли нагадати:",
+        text=f"{text}\n\n📌 Оберіть, коли нагадати:",
         reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=False,
     )
     await update.message.reply_text("✅ Опубліковано в каналі.")
 
@@ -187,8 +223,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user = query.from_user
-    _, idx_str, text = query.data.split("|", 2)
+    _, idx_str, pending_id_str = query.data.split("|", 2)
     idx = int(idx_str)
+    pending_id = int(pending_id_str)
+    text = get_pending_text(pending_id)
     label, delta = REMINDER_OPTIONS[idx]
 
     if not is_known_user(user.id):
@@ -214,7 +252,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await query.message.reply_text(
-        f"✅ {user.first_name}, нагадаю вам «{text}» — {label.lower()}."
+        f"✅ {user.first_name}, нагадаю вам про цю можливість — {label.lower()}."
     )
 
 
