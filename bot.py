@@ -49,13 +49,16 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "reminders.db")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВАШ_ТОКЕН_ТУТ")
+# ID каналу/групи, куди бот публікуватиме повідомлення з кнопками.
+# Дізнатись ID можна командою /channelid, написаною прямо в каналі.
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 
 # Варіанти нагадувань: (підпис на кнопці, кількість хвилин)
 # Для тесту можна лишити хвилини, потім замінити на дні/тижні.
 REMINDER_OPTIONS = [
-    ("Через 1 день", timedelta(days=1)),
-    ("Через 3 дні", timedelta(days=3)),
-    ("Через тиждень", timedelta(weeks=1)),
+    ("За 1 день", timedelta(days=1)),
+    ("За 3 дні", timedelta(days=3)),
+    ("За тиждень", timedelta(weeks=1)),
 ]
 
 
@@ -132,20 +135,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Допоміжна команда: написати /channelid прямо в каналі/групі,
+    щоб дізнатись його ID (знадобиться для змінної CHANNEL_ID).
+    """
+    await update.message.reply_text(f"ID цього чату: {update.effective_chat.id}")
+
+
 async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Команда для публікації повідомлення з кнопками вибору нагадування.
-    Викликати в каналі/групі, напр.: /remind Не забудьте подати заявку!
+    Команда /remind — пишеться ПРИВАТНО боту (не в каналі!).
+    Приклад: /remind Не забудьте подати заявку!
+    Бот сам публікує повідомлення з кнопками в канал (CHANNEL_ID),
+    тому в каналі ніхто не побачить, хто саме викликав команду.
     """
+    if update.effective_chat.type != "private":
+        # Якщо хтось випадково напише команду в групі — тихо ігноруємо,
+        # щоб не спалювати, хто саме її викликав.
+        return
+
+    if not CHANNEL_ID:
+        await update.message.reply_text(
+            "⚠️ Не налаштовано CHANNEL_ID. Напишіть /channelid прямо в каналі, "
+            "щоб дізнатись його ID, і додайте його в змінні середовища Railway."
+        )
+        return
+
     text = " ".join(context.args) if context.args else "Нагадати про це?"
     keyboard = [
         [InlineKeyboardButton(label, callback_data=f"remind|{i}|{text}")]
         for i, (label, _) in enumerate(REMINDER_OPTIONS)
     ]
-    await update.message.reply_text(
-        f"📌 {text}\n\nОберіть, коли нагадати:",
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=f"📌 {text}\n\nОберіть, коли нагадати:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    await update.message.reply_text("✅ Опубліковано в каналі.")
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -227,6 +254,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("remind", post_reminder_prompt))
+    app.add_handler(CommandHandler("channelid", channel_id_cmd))
     app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^remind\|"))
 
     app.post_init = restore_pending_jobs
