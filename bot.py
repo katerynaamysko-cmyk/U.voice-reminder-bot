@@ -205,10 +205,16 @@ async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
     # там не вміститься — зберігаємо його окремо в базі, а в кнопку кладемо лише ID.
     pending_id = save_pending_text(text)
 
+    bot_username = (await context.bot.get_me()).username
     keyboard = [
         [InlineKeyboardButton(label, callback_data=f"remind|{i}|{pending_id}")]
         for i, (label, _) in enumerate(REMINDER_OPTIONS)
     ]
+    # Додаємо окрему кнопку-посилання на бота — щоб ті, хто ще не писав
+    # йому /start, могли одразу перейти й активувати приватні нагадування.
+    keyboard.append(
+        [InlineKeyboardButton("▶️ Активувати нагадування (тиснути раз)", url=f"https://t.me/{bot_username}?start=go")]
+    )
     await context.bot.send_message(
         chat_id=CHANNEL_ID,
         text=f"{text}\n\n📌 Оберіть, коли нагадати:",
@@ -229,22 +235,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label, delta = REMINDER_OPTIONS[idx]
 
     if not is_known_user(user.id):
-        bot_username = (await context.bot.get_me()).username
-        link_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Написати боту", url=f"https://t.me/{bot_username}")]]
-        )
         # Приватне попередження — видно тільки тому, хто натиснув (query.answer з alert).
         await query.answer(
-            "Спершу напишіть боту /start в приваті, щоб отримувати нагадування.",
+            "Спершу натисніть кнопку '▶️ Активувати нагадування' під цим постом.",
             show_alert=True,
         )
-        try:
-            await context.bot.send_message(
-                chat_id=user.id,
-                text="Натисніть /start, щоб я міг надсилати вам нагадування.",
-            )
-        except Exception:
-            pass
         return
 
     remind_at = datetime.now() + delta
