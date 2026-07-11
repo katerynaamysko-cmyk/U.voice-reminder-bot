@@ -220,7 +220,6 @@ async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     user = query.from_user
     _, idx_str, pending_id_str = query.data.split("|", 2)
@@ -234,11 +233,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Написати боту", url=f"https://t.me/{bot_username}")]]
         )
-        await query.message.reply_text(
-            f"{user.first_name}, щоб отримувати нагадування в приват, "
-            "спершу напишіть боту /start (один раз).",
-            reply_markup=link_kb,
+        # Приватне попередження — видно тільки тому, хто натиснув (query.answer з alert).
+        await query.answer(
+            "Спершу напишіть боту /start в приваті, щоб отримувати нагадування.",
+            show_alert=True,
         )
+        try:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="Натисніть /start, щоб я міг надсилати вам нагадування.",
+            )
+        except Exception:
+            pass
         return
 
     remind_at = datetime.now() + delta
@@ -251,9 +257,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=f"reminder_{reminder_id}",
     )
 
-    await query.message.reply_text(
-        f"✅ {user.first_name}, нагадаю вам про цю можливість — {label.lower()}."
+    # Підтвердження надсилаємо ОСОБИСТО користувачу, а не в канал —
+    # щоб ніхто інший в каналі цього не бачив.
+    await context.bot.send_message(
+        chat_id=user.id,
+        text=f"✅ Нагадаю вам про цю можливість — {label.lower()}.",
     )
+    # І тихо підтверджуємо натискання кнопки (спливаюче повідомлення, видно тільки йому).
+    await query.answer("Нагадування встановлено ✅")
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
