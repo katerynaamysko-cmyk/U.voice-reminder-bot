@@ -224,4 +224,166 @@ async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
     lines = body.split("\n", 1)
     first_line = lines[0].strip()
     try:
-        deadline_date = datetime.strptime(first_line, "%d.%
+        deadline_date = datetime.strptime(first_line, "%d.%m.%Y")
+        deadline = deadline_date.replace(hour=9, minute=0, second=0, microsecond=0)
+        text = lines[1].lstrip("\n") if len(lines) > 1 else "Нагадати про це?"
+    except ValueError:
+        # Перший рядок — не дата, вважаємо, що дедлайну немає, весь body — це текст.
+        text = body if body else "Нагадати про це?"
+
+    if not text.strip():
+        text = "Нагадати про це?"
+
+    pending_id = save_pending_text(text, deadline)
+
+    bot_username = (await context.bot.get_me()).username
+    keyboard = []
+    now = datetime.now()
+    any_valid = False
+    for i, (label, delta) in enumerate(REMINDER_OPTIONS):
+        if deadline:
+            would_remind_at = deadline - delta
+            if would_remind_at <= now:
+                # Цей варіант вже запізно пропонувати — дедлайн занадто близько.
+                continue
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"remind|{i}|{pending_id}")])
+        any_valid = True
+
+    if not any_valid:
+        # Або дедлайну немає (тоді всі варіанти валідні — цей блок не спрацює),
+        # або дедлайн вже настільки близько, що жоден варіант "за X до дедлайну" не підходить.
+        keyboard = [
+            [InlineKeyboardButton(label, callback_data=f"remind|{i}|{pending_id}")]
+            for i, (label, _) in enumerate(REMINDER_OPTIONS)
+        ]
+
+    keyboard.append(
+        [InlineKeyboardButton("▶️ Активувати нагадування (тиснути раз)", url=f"https://t.me/{bot_username}?start=go")]
+    )
+
+    deadline_line = f"\n\n⏰ Дедлайн: {deadline.strftime('%d.%m.%Y')}" if deadline else ""
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=f"{text}{deadline_line}\n\n📌 Оберіть, коли нагадати:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=False,
+    )
+    confirmation = "✅ Опубліковано в каналі."
+    if not deadline:
+        confirmation += (
+            "\n\nℹ️ Дедлайн не вказано (перший рядок мав бути датою ДД.ММ.РРРР) — "
+            "нагадування рахуватимуться від моменту натискання кнопки, а не від дедлайну."
+        )
+    await update.message.reply_text(confirmation)
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    user = query.from_user
+    _, idx_str, pending_id_str = query.data.split("|", 2)
+    idx = int(idx_str)
+    pending_id = int(pending_id_str)
+    text, deadline = get_pending(pending_id)
+    label, delta = REMINDER_OPTIONS[idx]
+
+    if not is_known_user(user.id):
+        await query.answer(
+            "Спершу натисніть кнопку '▶️ Активувати нагадування' під цим постом.",
+            show_alert=True,
+        )
+        return
+
+    now = datetime.now()
+    if deadline:
+        remind_at = deadline - delta
+    else:
+        # Дедлайн не вказаний — рахуємо від моменту натискання (старий режим).
+        remind_at = now + delta
+
+    if remind_at <= now:
+        await query.answer(
+            "⏰ Цей варіант вже запізно обирати — дедлайн занадто близько.",
+            show_alert=True,
+        )
+        return
+
+    reminder_id = save_reminder(user.id, user.id, text, remind_at)
+    delay_seconds = (remind_at - now).total_seconds()
+
+    context.job_queue.run_once(
+        send_reminder,
+        when=delay_seconds,
+        data={"reminder_id": reminder_id, "user_id": user.id, "text": text},
+        name=f"reminder_{reminder_id}",
+    )
+
+    when_str = remind_at.strftime("%d.%m.%Y о %H:%M")
+    await context.bot.send_message(
+        chat_id=user.id,
+        text=f"✅ Нагадаю вам про цю можливість {when_str}.",
+    )
+    await query.answer("Нагадування встановлено ✅")
+
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    job_data = context.job.data
+    try:
+        await context.bot.send_message(
+            chat_id=job_data["user_id"],
+            text=f"🔔 Нагадування: {job_data['text']}",
+        )
+        mark_sent(job_data["reminder_id"])
+    except Forbidden:
+        logger.warning(
+            "Не вдалось надіслати нагадування user_id=%s: бот заблокований користувачем.",
+            job_data["user_id"],
+        )
+
+
+async def restore_pending_jobs(app: Application):
+    """Після рестарту бота повторно ставимо в чергу ще не надіслані нагадування."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, user_id, text, remind_at FROM reminders WHERE sent = 0"
+    ).fetchall()
+    conn.close()
+
+    now = datetime.now()
+    for reminder_id, user_id, text, remind_at_str in rows:
+        remind_at = datetime.fromisoformat(remind_at_str)
+        delay = (remind_at - now).total_seconds()
+        if delay < 0:
+            delay = 0
+        app.job_queue.run_once(
+            send_reminder,
+            when=delay,
+            data={"reminder_id": reminder_id, "user_id": user_id, "text": text},
+            name=f"reminder_{reminder_id}",
+        )
+
+
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("remind", post_reminder_prompt))
+    # CommandHandler за замовчуванням не завжди ловить пости в каналі (channel_post),
+    # тому окремо реєструємо /channelid через MessageHandler з явним фільтром.
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^/channelid") & (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST),
+            channel_id_cmd,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^remind\|"))
+
+    app.post_init = restore_pending_jobs
+
+    logger.info("Бот запущено.")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
