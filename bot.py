@@ -24,9 +24,11 @@ Telegram-бот "Нагадувач"
 """
 
 import logging
+import re
 import sqlite3
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Update,
@@ -61,6 +63,20 @@ REMINDER_OPTIONS = [
     ("За 3 дні", timedelta(days=3)),
     ("За тиждень", timedelta(weeks=1)),
 ]
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+# Часові пояси на вибір для персональних нагадувань.
+TIMEZONE_OPTIONS = [
+    ("🇺🇦 Київ", "Europe/Kyiv"),
+    ("🇵🇱 Варшава / 🇩🇪 Берлін / 🇫🇷 Париж", "Europe/Warsaw"),
+    ("🇬🇧 Лондон", "Europe/London"),
+    ("🇮🇹 Рим / 🇪🇸 Мадрид", "Europe/Rome"),
+    ("🇺🇸 Нью-Йорк", "America/New_York"),
+]
+
+# Години доби на вибір для отримання нагадувань.
+# Години більше не обираються кнопками — людина вписує свій час текстом.
 
 
 # ---------- База даних ----------
@@ -166,6 +182,58 @@ def is_known_user(user_id: int) -> bool:
     return row is not None
 
 
+def _ensure_user_prefs_table(conn):
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS user_prefs (
+            user_id INTEGER PRIMARY KEY,
+            tz TEXT NOT NULL DEFAULT 'Europe/Kyiv',
+            hour INTEGER NOT NULL DEFAULT 9,
+            minute INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
+    # Якщо таблиця вже існувала до додавання хвилин — додаємо колонку окремо.
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(user_prefs)").fetchall()]
+    if "minute" not in cols:
+        conn.execute("ALTER TABLE user_prefs ADD COLUMN minute INTEGER NOT NULL DEFAULT 0")
+
+
+def get_user_prefs(user_id: int):
+    """Повертає (tz_string, hour, minute) — за замовчуванням Київ, 09:00."""
+    conn = sqlite3.connect(DB_PATH)
+    _ensure_user_prefs_table(conn)
+    row = conn.execute(
+        "SELECT tz, hour, minute FROM user_prefs WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    if row:
+        return row[0], row[1], row[2]
+    return "Europe/Kyiv", 9, 0
+
+
+def set_user_tz(user_id: int, tz: str):
+    conn = sqlite3.connect(DB_PATH)
+    _ensure_user_prefs_table(conn)
+    conn.execute(
+        """INSERT INTO user_prefs (user_id, tz) VALUES (?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET tz = excluded.tz""",
+        (user_id, tz),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_user_time(user_id: int, hour: int, minute: int):
+    conn = sqlite3.connect(DB_PATH)
+    _ensure_user_prefs_table(conn)
+    conn.execute(
+        """INSERT INTO user_prefs (user_id, hour, minute) VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET hour = excluded.hour, minute = excluded.minute""",
+        (user_id, hour, minute),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ---------- Хендлери команд ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,6 +242,68 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Готово! Тепер я можу надсилати вам нагадування у приват. "
         "Поверніться до каналу й натисніть потрібну кнопку нагадування."
+    )
+    await show_timezone_prompt(update.effective_chat.id, context)
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/settings — будь-коли змінити часовий пояс і зручну годину нагадувань."""
+    if update.effective_chat.type != "private":
+        return
+    await show_timezone_prompt(update.effective_chat.id, context)
+
+
+async def show_timezone_prompt(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton(label, callback_data=f"settz|{i}")]
+        for i, (label, _) in enumerate(TIMEZONE_OPTIONS)
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="🌍 Оберіть свій часовий пояс — нагадування приходитимуть за ним:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def settz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split("|", 1)[1])
+    label, tz_str = TIMEZONE_OPTIONS[idx]
+    set_user_tz(query.from_user.id, tz_str)
+
+    # Позначаємо, що зараз чекаємо від цього користувача текст із часом.
+    context.user_data["awaiting_time"] = True
+
+    await query.edit_message_text(
+        f"✅ Часовий пояс: {label}\n\n"
+        "🕘 Тепер напишіть зручну годину для нагадувань у форматі ГГ:ХХ, "
+        "наприклад: 09:00 або 18:30"
+    )
+
+
+async def time_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловить текстове повідомлення з часом (ГГ:ХХ), яке людина вписує після вибору поясу."""
+    if not context.user_data.get("awaiting_time"):
+        return  # Звичайне повідомлення, не пов'язане з налаштуванням часу — ігноруємо.
+
+    raw = (update.message.text or "").strip()
+    match = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", raw)
+    if not match:
+        await update.message.reply_text(
+            "⚠️ Не розпізнав час. Напишіть у форматі ГГ:ХХ, наприклад 09:00 або 18:30."
+        )
+        return
+
+    hour, minute = int(match.group(1)), int(match.group(2))
+    set_user_time(update.effective_user.id, hour, minute)
+    context.user_data["awaiting_time"] = False
+
+    tz_str, _, _ = get_user_prefs(update.effective_user.id)
+    tz_label = next((label for label, tz in TIMEZONE_OPTIONS if tz == tz_str), tz_str)
+    await update.message.reply_text(
+        f"✅ Готово!\nЧасовий пояс: {tz_label}\nГодина нагадувань: {hour:02d}:{minute:02d}\n\n"
+        "Змінити можна будь-коли командою /settings."
     )
 
 
@@ -225,7 +355,7 @@ async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
     first_line = lines[0].strip()
     try:
         deadline_date = datetime.strptime(first_line, "%d.%m.%Y")
-        deadline = deadline_date.replace(hour=9, minute=0, second=0, microsecond=0)
+        deadline = deadline_date  # зберігаємо лише дату (час підставимо персонально для кожного)
         text = lines[1].lstrip("\n") if len(lines) > 1 else "Нагадати про це?"
     except ValueError:
         # Перший рядок — не дата, вважаємо, що дедлайну немає, весь body — це текст.
@@ -238,12 +368,12 @@ async def post_reminder_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
 
     bot_username = (await context.bot.get_me()).username
     keyboard = []
-    now = datetime.now()
+    reference_now_date = datetime.now(KYIV_TZ).date()
     any_valid = False
     for i, (label, delta) in enumerate(REMINDER_OPTIONS):
         if deadline:
-            would_remind_at = deadline - delta
-            if would_remind_at <= now:
+            would_remind_date = deadline.date() - delta
+            if would_remind_date < reference_now_date:
                 # Цей варіант вже запізно пропонувати — дедлайн занадто близько.
                 continue
         keyboard.append([InlineKeyboardButton(label, callback_data=f"remind|{i}|{pending_id}")])
@@ -294,9 +424,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    now = datetime.now()
+    tz_str, hour, minute = get_user_prefs(user.id)
+    user_tz = ZoneInfo(tz_str)
+    now = datetime.now(user_tz)
+
     if deadline:
-        remind_at = deadline - delta
+        target_date = deadline.date() - delta
+        remind_at = datetime(
+            target_date.year, target_date.month, target_date.day,
+            hour, minute, 0, tzinfo=user_tz,
+        )
     else:
         # Дедлайн не вказаний — рахуємо від моменту натискання (старий режим).
         remind_at = now + delta
@@ -321,7 +458,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     when_str = remind_at.strftime("%d.%m.%Y о %H:%M")
     await context.bot.send_message(
         chat_id=user.id,
-        text=f"✅ Нагадаю вам про цю можливість {when_str}.",
+        text=f"✅ Нагадаю вам про цю можливість {when_str} (за вашим часом).",
     )
     await query.answer("Нагадування встановлено ✅")
 
@@ -349,9 +486,12 @@ async def restore_pending_jobs(app: Application):
     ).fetchall()
     conn.close()
 
-    now = datetime.now()
     for reminder_id, user_id, text, remind_at_str in rows:
         remind_at = datetime.fromisoformat(remind_at_str)
+        if remind_at.tzinfo is None:
+            # Старі записи без часового поясу (до оновлення) — вважаємо, що це Київ.
+            remind_at = remind_at.replace(tzinfo=KYIV_TZ)
+        now = datetime.now(remind_at.tzinfo)
         delay = (remind_at - now).total_seconds()
         if delay < 0:
             delay = 0
@@ -368,6 +508,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("remind", post_reminder_prompt))
     # CommandHandler за замовчуванням не завжди ловить пости в каналі (channel_post),
     # тому окремо реєструємо /channelid через MessageHandler з явним фільтром.
@@ -375,6 +516,13 @@ def main():
         MessageHandler(
             filters.Regex(r"^/channelid") & (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST),
             channel_id_cmd,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(settz_handler, pattern=r"^settz\|"))
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            time_input_handler,
         )
     )
     app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^remind\|"))
