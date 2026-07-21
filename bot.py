@@ -27,8 +27,7 @@ import logging
 import re
 import sqlite3
 import os
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 from telegram import (
     Update,
@@ -64,19 +63,34 @@ REMINDER_OPTIONS = [
     ("За тиждень", timedelta(weeks=1)),
 ]
 
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
+KYIV_TZ = timezone(timedelta(hours=3))  # орієнтир для внутрішніх перевірок дат
 
-# Часові пояси на вибір для персональних нагадувань.
-TIMEZONE_OPTIONS = [
-    ("🇺🇦 Київ", "Europe/Kyiv"),
-    ("🇵🇱 Варшава / 🇩🇪 Берлін / 🇫🇷 Париж", "Europe/Warsaw"),
-    ("🇬🇧 Лондон", "Europe/London"),
-    ("🇮🇹 Рим / 🇪🇸 Мадрид", "Europe/Rome"),
-    ("🇺🇸 Нью-Йорк", "America/New_York"),
+# Повний перелік часових поясів як зсувів UTC — від UTC−12 до UTC+14,
+# щоб людина з будь-якої країни (включно з Китаєм, Австралією тощо) могла обрати свій.
+_UTC_OFFSETS = [
+    -12, -11, -10, -9.5, -9, -8, -7, -6, -5, -4, -3.5, -3, -2, -1,
+    0,
+    1, 2, 3, 3.5, 4, 4.5, 5, 5.5, 5.75, 6, 6.5, 7, 8, 8.75, 9, 9.5,
+    10, 10.5, 11, 12, 12.75, 13, 14,
 ]
 
-# Години доби на вибір для отримання нагадувань.
-# Години більше не обираються кнопками — людина вписує свій час текстом.
+
+def _format_offset_label(offset: float) -> str:
+    sign = "+" if offset >= 0 else "−"
+    whole = int(abs(offset))
+    frac = abs(offset) - whole
+    minutes = round(frac * 60)
+    return f"UTC{sign}{whole}" if minutes == 0 else f"UTC{sign}{whole}:{minutes:02d}"
+
+
+def _format_offset_value(offset: float) -> str:
+    # Рядок, який зберігається в базі (без знаку "+", але зі знаком "-").
+    return str(offset)
+
+
+TIMEZONE_OPTIONS = [
+    (_format_offset_label(o), _format_offset_value(o)) for o in _UTC_OFFSETS
+]
 
 
 # ---------- База даних ----------
@@ -186,7 +200,7 @@ def _ensure_user_prefs_table(conn):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS user_prefs (
             user_id INTEGER PRIMARY KEY,
-            tz TEXT NOT NULL DEFAULT 'Europe/Kyiv',
+            tz TEXT NOT NULL DEFAULT '3',
             hour INTEGER NOT NULL DEFAULT 9,
             minute INTEGER NOT NULL DEFAULT 0
         )"""
@@ -207,7 +221,7 @@ def get_user_prefs(user_id: int):
     conn.close()
     if row:
         return row[0], row[1], row[2]
-    return "Europe/Kyiv", 9, 0
+    return "3", 9, 0
 
 
 def set_user_tz(user_id: int, tz: str):
@@ -254,13 +268,15 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_timezone_prompt(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton(label, callback_data=f"settz|{i}")]
+    buttons = [
+        InlineKeyboardButton(label, callback_data=f"settz|{i}")
         for i, (label, _) in enumerate(TIMEZONE_OPTIONS)
     ]
+    # Групуємо по 4 кнопки в рядок, щоб довгий список UTC-зсувів був компактним.
+    keyboard = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
     await context.bot.send_message(
         chat_id=chat_id,
-        text="🌍 Оберіть свій часовий пояс — нагадування приходитимуть за ним:",
+        text="🌍 Оберіть свій часовий пояс (UTC) — нагадування приходитимуть за ним:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -425,7 +441,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tz_str, hour, minute = get_user_prefs(user.id)
-    user_tz = ZoneInfo(tz_str)
+    user_tz = timezone(timedelta(hours=float(tz_str)))
     now = datetime.now(user_tz)
 
     if deadline:
