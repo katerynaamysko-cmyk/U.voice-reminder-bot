@@ -28,6 +28,7 @@ import re
 import sqlite3
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Update,
@@ -65,32 +66,72 @@ REMINDER_OPTIONS = [
 
 KYIV_TZ = timezone(timedelta(hours=3))  # орієнтир для внутрішніх перевірок дат
 
-# Повний перелік часових поясів як зсувів UTC — від UTC−12 до UTC+14,
-# щоб людина з будь-якої країни (включно з Китаєм, Австралією тощо) могла обрати свій.
-_UTC_OFFSETS = [
-    -12, -11, -10, -9.5, -9, -8, -7, -6, -5, -4, -3.5, -3, -2, -1,
-    0,
-    1, 2, 3, 3.5, 4, 4.5, 5, 5.5, 5.75, 6, 6.5, 7, 8, 8.75, 9, 9.5,
-    10, 10.5, 11, 12, 12.75, 13, 14,
-]
+# Розпізнавання міста/країни -> IANA часовий пояс (автоматично враховує літній/зимовий час).
+# Ключі — нижнім регістром, без розділових знаків. Додавайте нові за потреби.
+CITY_TIMEZONES = {
+    "київ": "Europe/Kyiv", "україна": "Europe/Kyiv", "львів": "Europe/Kyiv",
+    "одеса": "Europe/Kyiv", "харків": "Europe/Kyiv", "дніпро": "Europe/Kyiv",
+    "варшава": "Europe/Warsaw", "польща": "Europe/Warsaw", "краків": "Europe/Warsaw",
+    "вроцлав": "Europe/Warsaw", "гданськ": "Europe/Warsaw", "познань": "Europe/Warsaw",
+    "берлін": "Europe/Berlin", "німеччина": "Europe/Berlin", "мюнхен": "Europe/Berlin",
+    "франкфурт": "Europe/Berlin", "гамбург": "Europe/Berlin", "кельн": "Europe/Berlin",
+    "бремен": "Europe/Berlin", "штутгарт": "Europe/Berlin", "дюссельдорф": "Europe/Berlin",
+    "прага": "Europe/Prague", "чехія": "Europe/Prague", "брно": "Europe/Prague",
+    "братислава": "Europe/Bratislava", "словаччина": "Europe/Bratislava",
+    "відень": "Europe/Vienna", "австрія": "Europe/Vienna", "зальцбург": "Europe/Vienna",
+    "рим": "Europe/Rome", "італія": "Europe/Rome", "мілан": "Europe/Rome", "неаполь": "Europe/Rome",
+    "мадрид": "Europe/Madrid", "іспанія": "Europe/Madrid", "барселона": "Europe/Madrid",
+    "лісабон": "Europe/Lisbon", "португалія": "Europe/Lisbon",
+    "париж": "Europe/Paris", "франція": "Europe/Paris", "ліон": "Europe/Paris",
+    "лондон": "Europe/London", "великобританія": "Europe/London",
+    "англія": "Europe/London", "манчестер": "Europe/London", "шотландія": "Europe/London",
+    "амстердам": "Europe/Amsterdam", "нідерланди": "Europe/Amsterdam", "голландія": "Europe/Amsterdam",
+    "брюссель": "Europe/Brussels", "бельгія": "Europe/Brussels",
+    "дублін": "Europe/Dublin", "ірландія": "Europe/Dublin",
+    "стокгольм": "Europe/Stockholm", "швеція": "Europe/Stockholm",
+    "осло": "Europe/Oslo", "норвегія": "Europe/Oslo",
+    "копенгаген": "Europe/Copenhagen", "данія": "Europe/Copenhagen",
+    "гельсінкі": "Europe/Helsinki", "фінляндія": "Europe/Helsinki",
+    "цюрих": "Europe/Zurich", "швейцарія": "Europe/Zurich", "женева": "Europe/Zurich",
+    "вільнюс": "Europe/Vilnius", "литва": "Europe/Vilnius",
+    "рига": "Europe/Riga", "латвія": "Europe/Riga",
+    "таллінн": "Europe/Tallinn", "естонія": "Europe/Tallinn",
+    "будапешт": "Europe/Budapest", "угорщина": "Europe/Budapest",
+    "бухарест": "Europe/Bucharest", "румунія": "Europe/Bucharest",
+    "софія": "Europe/Sofia", "болгарія": "Europe/Sofia",
+    "афіни": "Europe/Athens", "греція": "Europe/Athens",
+    "загреб": "Europe/Zagreb", "хорватія": "Europe/Zagreb",
+    "белград": "Europe/Belgrade", "сербія": "Europe/Belgrade",
+    "стамбул": "Europe/Istanbul", "туреччина": "Europe/Istanbul", "анкара": "Europe/Istanbul",
+    "нью-йорк": "America/New_York", "нью йорк": "America/New_York",
+    "лос-анджелес": "America/Los_Angeles", "лос анджелес": "America/Los_Angeles",
+    "чикаго": "America/Chicago", "торонто": "America/Toronto", "канада": "America/Toronto",
+    "пекін": "Asia/Shanghai", "китай": "Asia/Shanghai", "шанхай": "Asia/Shanghai",
+    "токіо": "Asia/Tokyo", "японія": "Asia/Tokyo",
+    "сідней": "Australia/Sydney", "австралія": "Australia/Sydney",
+    "дубай": "Asia/Dubai", "оае": "Asia/Dubai",
+    "делі": "Asia/Kolkata", "індія": "Asia/Kolkata", "мумбаї": "Asia/Kolkata",
+}
 
 
-def _format_offset_label(offset: float) -> str:
-    sign = "+" if offset >= 0 else "−"
-    whole = int(abs(offset))
-    frac = abs(offset) - whole
-    minutes = round(frac * 60)
-    return f"UTC{sign}{whole}" if minutes == 0 else f"UTC{sign}{whole}:{minutes:02d}"
+def resolve_timezone(raw_input: str):
+    """Шукає збіг міста/країни в словнику. Повертає IANA-рядок або None, якщо не знайдено."""
+    key = raw_input.strip().lower()
+    if key in CITY_TIMEZONES:
+        return CITY_TIMEZONES[key]
+    # Пробуємо часткові збіги (наприклад "м. Берлін" чи "Berlin, Germany").
+    for name, tz_name in CITY_TIMEZONES.items():
+        if name in key:
+            return tz_name
+    return None
 
 
-def _format_offset_value(offset: float) -> str:
-    # Рядок, який зберігається в базі (без знаку "+", але зі знаком "-").
-    return str(offset)
-
-
-TIMEZONE_OPTIONS = [
-    (_format_offset_label(o), _format_offset_value(o)) for o in _UTC_OFFSETS
-]
+def tzinfo_from_stored(tz_value: str):
+    """Перетворює збережений рядок (IANA-назва або 'UTC±N') на об'єкт tzinfo."""
+    if tz_value.upper().startswith("UTC"):
+        offset_part = tz_value.upper().replace("UTC", "").strip()
+        return timezone(timedelta(hours=float(offset_part or 0)))
+    return ZoneInfo(tz_value)
 
 
 # ---------- База даних ----------
@@ -200,7 +241,7 @@ def _ensure_user_prefs_table(conn):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS user_prefs (
             user_id INTEGER PRIMARY KEY,
-            tz TEXT NOT NULL DEFAULT '3',
+            tz TEXT NOT NULL DEFAULT 'Europe/Kyiv',
             hour INTEGER NOT NULL DEFAULT 9,
             minute INTEGER NOT NULL DEFAULT 0
         )"""
@@ -221,7 +262,7 @@ def get_user_prefs(user_id: int):
     conn.close()
     if row:
         return row[0], row[1], row[2]
-    return "3", 9, 0
+    return "Europe/Kyiv", 9, 0
 
 
 def set_user_tz(user_id: int, tz: str):
@@ -257,70 +298,73 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Готово! Тепер я можу надсилати вам нагадування у приват. "
         "Поверніться до каналу й натисніть потрібну кнопку нагадування."
     )
-    await show_timezone_prompt(update.effective_chat.id, context)
+    await ask_city(update.effective_chat.id, context)
 
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/settings — будь-коли змінити часовий пояс і зручну годину нагадувань."""
+    """/settings — будь-коли змінити місто/пояс і зручну годину нагадувань."""
     if update.effective_chat.type != "private":
         return
-    await show_timezone_prompt(update.effective_chat.id, context)
+    await ask_city(update.effective_chat.id, context)
 
 
-async def show_timezone_prompt(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    buttons = [
-        InlineKeyboardButton(label, callback_data=f"settz|{i}")
-        for i, (label, _) in enumerate(TIMEZONE_OPTIONS)
-    ]
-    # Групуємо по 4 кнопки в рядок, щоб довгий список UTC-зсувів був компактним.
-    keyboard = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+async def ask_city(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_city"] = True
+    context.user_data["awaiting_time"] = False
     await context.bot.send_message(
         chat_id=chat_id,
-        text="🌍 Оберіть свій часовий пояс (UTC) — нагадування приходитимуть за ним:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        text="🌍 Звідки ви? Напишіть місто або країну (наприклад: Берлін, Варшава, Київ, Лондон) — "
+        "я сам визначу ваш часовий пояс.",
     )
 
 
-async def settz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    idx = int(query.data.split("|", 1)[1])
-    label, tz_str = TIMEZONE_OPTIONS[idx]
-    set_user_tz(query.from_user.id, tz_str)
-
-    # Позначаємо, що зараз чекаємо від цього користувача текст із часом.
-    context.user_data["awaiting_time"] = True
-
-    await query.edit_message_text(
-        f"✅ Часовий пояс: {label}\n\n"
-        "🕘 Тепер напишіть зручну годину для нагадувань у форматі ГГ:ХХ, "
-        "наприклад: 09:00 або 18:30"
-    )
-
-
-async def time_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловить текстове повідомлення з часом (ГГ:ХХ), яке людина вписує після вибору поясу."""
-    if not context.user_data.get("awaiting_time"):
-        return  # Звичайне повідомлення, не пов'язане з налаштуванням часу — ігноруємо.
-
-    raw = (update.message.text or "").strip()
-    match = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", raw)
-    if not match:
+async def onboarding_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ловить текстові повідомлення в приваті під час налаштування:
+    1) очікує назву міста/країни -> визначає часовий пояс,
+    2) потім очікує час у форматі ГГ:ХХ.
+    Звичайні повідомлення поза цим "майстром" ігноруються.
+    """
+    if context.user_data.get("awaiting_city"):
+        raw = update.message.text or ""
+        tz_name = resolve_timezone(raw)
+        if not tz_name:
+            await update.message.reply_text(
+                "😕 Не впізнав таке місто. Спробуйте написати назву популярного міста "
+                "(наприклад: Берлін, Варшава, Прага, Лондон, Нью-Йорк) або країни."
+            )
+            return
+        set_user_tz(update.effective_user.id, tz_name)
+        context.user_data["awaiting_city"] = False
+        context.user_data["awaiting_time"] = True
         await update.message.reply_text(
-            "⚠️ Не розпізнав час. Напишіть у форматі ГГ:ХХ, наприклад 09:00 або 18:30."
+            f"✅ Визначив ваш часовий пояс: {tz_name}\n\n"
+            "🕘 Тепер напишіть зручну годину для нагадувань у форматі ГГ:ХХ, "
+            "наприклад: 09:00 або 18:30"
         )
         return
 
-    hour, minute = int(match.group(1)), int(match.group(2))
-    set_user_time(update.effective_user.id, hour, minute)
-    context.user_data["awaiting_time"] = False
+    if context.user_data.get("awaiting_time"):
+        raw = (update.message.text or "").strip()
+        match = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", raw)
+        if not match:
+            await update.message.reply_text(
+                "⚠️ Не розпізнав час. Напишіть у форматі ГГ:ХХ, наприклад 09:00 або 18:30."
+            )
+            return
 
-    tz_str, _, _ = get_user_prefs(update.effective_user.id)
-    tz_label = next((label for label, tz in TIMEZONE_OPTIONS if tz == tz_str), tz_str)
-    await update.message.reply_text(
-        f"✅ Готово!\nЧасовий пояс: {tz_label}\nГодина нагадувань: {hour:02d}:{minute:02d}\n\n"
-        "Змінити можна будь-коли командою /settings."
-    )
+        hour, minute = int(match.group(1)), int(match.group(2))
+        set_user_time(update.effective_user.id, hour, minute)
+        context.user_data["awaiting_time"] = False
+
+        tz_name, _, _ = get_user_prefs(update.effective_user.id)
+        await update.message.reply_text(
+            f"✅ Готово!\nЧасовий пояс: {tz_name}\nГодина нагадувань: {hour:02d}:{minute:02d}\n\n"
+            "Змінити можна будь-коли командою /settings."
+        )
+        return
+
+    # Жоден "майстер" не активний — звичайне повідомлення, ігноруємо.
 
 
 async def channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -441,7 +485,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tz_str, hour, minute = get_user_prefs(user.id)
-    user_tz = timezone(timedelta(hours=float(tz_str)))
+    user_tz = tzinfo_from_stored(tz_str)
     now = datetime.now(user_tz)
 
     if deadline:
@@ -534,11 +578,10 @@ def main():
             channel_id_cmd,
         )
     )
-    app.add_handler(CallbackQueryHandler(settz_handler, pattern=r"^settz\|"))
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            time_input_handler,
+            onboarding_text_handler,
         )
     )
     app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^remind\|"))
